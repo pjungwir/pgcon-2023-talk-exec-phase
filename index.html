@@ -12,13 +12,22 @@
 
 		<!-- Theme used for syntax highlighted code -->
 		<link rel="stylesheet" href="plugin/highlight/monokai.css">
+<style>
+/*
+ * We want to highlight certain lines in our code blocks,
+ * but we don't want to show line numbers:
+ */
+.hljs-ln-numbers {
+  display: none;
+}
+</style>
 	</head>
 	<body>
 		<div class="reveal">
 			<div class="slides">
-				<section
+        <section
           data-markdown="slides.md"
-          data-separator"^\n\n\n"
+          data-separator="^\n\n\n"
           data-separator-vertical="^\n\n"
           data-separator-notes="^Notes:"
           data-charset="utf-8">
