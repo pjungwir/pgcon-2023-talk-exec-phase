@@ -1,4 +1,4 @@
-# Postgres Hacking: Exec Nodes
+# Postgres Pipeline: Esp Emph Exec
 
 by Paul Jungwirth
 
@@ -12,7 +12,8 @@ Notes:
 - I do independent consulting & development through my company Illuminated Computing.
 - When I'm lucky I get to do Postgres work.
 - I've been a minor contributor since 2016.
-- I've been working on adding SQL:2011 temporal support for the last few years.
+  - I added multiranges a while back,
+  - and since then I've been working on adding SQL:2011 temporal support.
 
 - As a newish contributor, I've often wished for a comprehensive guide to hacking on Postgres.
 - There are some great articles and talks out there already,
@@ -58,33 +59,46 @@ Notes:
 
 # For Example
 
-<pre class="code-wrapper">
-<code class="text hljs plaintext" data-noescape><span class="fragment highlight-current-green">ALTER TABLE ADD PERIOD valid_at (valid_from, valid_til)</span>
+```text [|1|3|5-7|9-10|5-7]
+ALTER TABLE ADD PERIOD valid_at (valid_from, valid_til)
 
-<span class="fragment highlight-current-green">PRIMARY KEY/UNIQUE (id, valid_at WITHOUT OVERLAPS)</span>
+PRIMARY KEY/UNIQUE (id, valid_at WITHOUT OVERLAPS)
 
-<span class="fragment highlight-current-green">UPDATE/DELETE FROM t
+UPDATE/DELETE FROM t
   FOR PORTION OF valid_at
-  FROM '2020-01-01' TO '2030-01-01'</span>
+  FROM '2020-01-01' TO '2030-01-01'
 
-<span class="fragment highlight-current-green">FOREIGN KEY (id, PERIOD valid_at)
-  REFERENCES parent (id, PERIOD valid_at)</span></code>
-</pre>
+FOREIGN KEY (id, PERIOD valid_at)
+  REFERENCES parent (id, PERIOD valid_at)
+```
 
 Notes:
 
 - Hopefully my temporal work will help make things concrete and motivated.
 - There are four parts:
-  - adding a PERIOD (which is a bit like a range but not a true column).
-  - adding a temporal primary key or unique constraint (which includes a PERIOD or (in Postgres) a range column).
-  - running a temporal UPDATE/DELETE, which targets just a span of time and leaves the other times untouched.
-  - adding a temporal foreign key.
-- Mostly I'll talk about `FOR PORTION OF`, because that's the most "interesting" command here.
+  - (higlight) adding a PERIOD (which is a bit like a range but not a true column).
+  - (highlight) adding a temporal primary key or unique constraint (which includes a PERIOD or (in Postgres) a range column).
+  - (highlight) running a temporal UPDATE/DELETE, which targets just a span of time and leaves the other times untouched.
+  - (highlight) adding a temporal foreign key.
+- (highlight) Mostly I'll talk about `FOR PORTION OF`, because that's the most "interesting" command here.
   - Basically SELECT and DML commands go through the full query pipeline.
-  - DDL are "utility commands" and get more direct treatment.
+  - Whereas DDL are "utility commands" and get more direct treatment.
     - They are still parsed & analyzed ...
       but then we don't build up a plan or a tree of executor nodes.
       We just do it.
+
+
+
+# For Example
+
+![FOR PORTION OF diagram](img/fpo.png)
+
+Notes:
+
+- Here is a quick visualization of what FOR PORTION OF does.
+  - The SQL:2011 standard says when we update the original row we should force the start/end bounds to the period targeted by FOR PORTION OF . . .
+  - and then implicitly INSERT up to two new rows to preserve the "leftovers" the UPDATE didn't target.
+  - By the way this is the only picture you get in this whole talk.
 
 
 
@@ -108,11 +122,11 @@ On Tue, Nov 14, 2017 at 9:43 AM Tom Lane <tgl@sss.pgh.pa.us> wrote:
 
 Notes:
 
-- Why it matters:
+- Why do all these phase matter?
   - I've noticed several patches being rejected because they do their work in the wrong phase.
     - There was a really cool temporal patch a few years ago that did nearly everything in the analysis phase. This quote is from that patch.
     - Early versions of the MERGE command patch were rejected with similar feedback.
-      - Robert Haas has an excellent post on that patch from 2019 giving specific reasons why you should do things in the right phase,
+      - Robert Haas wrote an excellent review of that patch from 2019 giving specific reasons why you should do things in the right phase,
         as well as links to past feedback with yet more reasons.
         Robert and Tom's posts are both in the References at the end of my talk.
         I've been trying to find them again for years actually, but I could never get Google to give me what I wanted.
@@ -133,8 +147,6 @@ Notes:
     and that meant it didn't work against an updateable view,
     even though the view included the range column referenced by FOR PORTION OF.
     Updateable views don't get handled until the rewrite phase.
-
-  - pg_dump??
 
 
 
@@ -163,7 +175,7 @@ exec_simple_query
 
 Notes:
 
-- Here are some of the major functions Postgres on its journey through the pipeline.
+- Here are some of the major functions Postgres calls on its journey through the pipeline.
 - There's parsing (highlight), analysis (highlight), rewriting (highlight).
   - The names here are kind of funny to me.
 - planning (highlight)
@@ -238,11 +250,13 @@ Notes:
   to copy a node, to print a node, to read a node back from what was printed.
 - Until recently you had to write all these each time you added a node,
   but now there is some clever codegen that does it for you.
+  - There is some tree-walking code with big switch statements where you might need to handle your new node type.
 
 - You will also see a lot of List members.
   - A List is also a Node, but it's a node that has a bunch of other nodes.
   - There are functions to build them, iterate over them, append to them.
   - When people say the Postgres is lispy, this is part of what they mean.
+  - Actually a lightning talk on Postgres's Lisp history would be a lot of fun, if any of you are qualified to give that.
 
 - Nodes & Lists are well-covered by other talks, so if you want to know more check the references at the end.
 
@@ -316,7 +330,7 @@ Notes:
 
 # syscache
 
-```c [|1-3|4|6|7-9|14|10-11|13]
+```c [|1-3|4|6|7-9|14|10|13|11]
 HeapTuple perTuple = SearchSysCache2(PERIODNAME,
                                      ObjectIdGetDatum(relid),
                                      PointerGetDatum(range_name));
@@ -339,12 +353,11 @@ Notes:
 - Syscache lets you look things up in the system catalog tables.
 - We call it a lot in analysis,
   so this seems like a good place to cover it.
-- Here `FOR PORTION OF` is looking up the period name.
-- (transition to highlight that part)
+- Here `FOR PORTION OF` is looking up the period name (higlight).
 - You see we're calling `SearchSysCache2`.
   This is defined in `utils/cache/syscache.c`.
-  We give it the cache name, here `PERIODNAME` (highligh). That determines the table to query, the index the use, and how big the cache should be.
-  This is search *2* because we search based on two attributes. Here the relation id (i.e. the table), and the range name. So those are the other arguments. (highlight)
+  We give it the cache name, here `PERIODNAME`. That determines the table to query, the index the use, and how big the cache should be.
+  This is search *2* because we search based on two attributes. Here the relation id (i.e. the table), and the period name. So those are the other arguments.
 - We don't necessarily get a result (highlight), so we have to check if we got something,
   and maybe report an error if not.
 - Then we cast the `HeapTuple` to a struct matching the `pg_period` table.
@@ -361,11 +374,9 @@ Notes:
 - For the range type we have a nice helper function, typeidType.
   This is just defined with the parser code.
   A `Type` is just a typedef'd `HeapTuple`, so we have to free that the same way.
+- Since it's really a HeapTuple, we free it the same way (highlight).
 - Another helpful function here is `typeTypeName`,
   which gives us a C-string for the type.
-- If you're lucky there will be a helpful function that calls `SearchSysCache` for you,
-  so don't forget to check for that.
-- Since it's really a HeapTuple, we free it the same way (highlight).
 
 
 
@@ -433,10 +444,6 @@ Notes:
 
 # RangeTblEntry
 
-```
-TODO: show getting this off pstate first to motivate it.
-```
-
 ```c
 typedef struct RangeTblEntry
 {
@@ -453,7 +460,10 @@ typedef struct RangeTblEntry
 
 Notes:
 
-- In the Postgres source you'll find many references to RangeTblEntries (or RTEs).
+- The last thing from analysis I want to talk about is `RangeTblEntry`.
+- The Query struct has a List called `rtable`,
+  which holds a bunch of these structs.
+  - We use this everywhere.
 - A range table is:
   1. not a database table (i.e. not a relation).
   2. has nothing to do with range types.
@@ -475,7 +485,7 @@ Notes:
 
 Notes:
 
-I don't want to spend time on this, but this is where we expand VIEWs and apply RULEs.
+I don't want to spend much time on rewriting, but this is where we expand VIEWs and apply RULEs.
 The main functions take a Query node and return a List of zero or more Query nodes.
 In the really easy cases we're just wrapping the passed-in Query node.
 
@@ -503,7 +513,7 @@ foreach(lc, parsetree->forPortionOf->rangeSet)
 
 Notes:
 
-- I did have to little bit here to make sure we could use `FOR PORTION OF` against an updatable view.
+- I did have to do little bit here to make sure we could use `FOR PORTION OF` against an updatable view.
 - If your feature should work against a view, maybe you need to do something here.
 - This might also be a worthwhile place for doing things you aren't supposed to do in analysis.
 - For example with UPDATE FOR PORTION OF, we are implicitly setting the `PERIOD` start/end columns.
@@ -555,7 +565,6 @@ PortalRun
         ExecModifyTable
 ```
 
-
 Notes:
 
 - Once we're ready to run the query, we pass our plan tree to the executor phase.
@@ -563,7 +572,7 @@ Notes:
   - Mostly this is how we implement cursors.
   - We can ignore it more or less.
 - But the portal functions call ExecutorStart and ExecutorRun (highlight).
-- ExecutorStart sets up another node tree.
+- ExecutorStart (highlight) sets up . . . another node tree.
   - `CreateExecutorState` creates an EState struct which has info about the overall execution.
   - Most plan nodes require some mutable state to execute, so each of them gets a sibling execState node.
   - ExecInitNode knows how to create the right execState for each kind of plan node.
@@ -580,7 +589,7 @@ Notes:
 
 # Executor
 
-```text
+```c [|4|5|6|7]
 typedef struct PlanState
 {
     pg_node_attr(abstract)
@@ -595,10 +604,10 @@ Notes:
 
 - Here is the "abstract superclass" for our execState nodes.
 - Each one has a type, just like any node (highlight)
-- Each gets a reference to its plan node.
+- Each gets a reference to its plan node (highlight).
   - Whereas the execState is mutable, the plan node is stable for the whole executor phase.
-- They all reference the top-level EState struct.
-- They also each reference a function to process their kind of executor node.
+- They all reference the top-level EState struct (highlight).
+- They also each reference a function to process their kind of executor node (highlight).
   - Later we'll chase these function pointers to do all the work.
 - There's a lot more stuff in this struct, but I'll skip it for now.
 
@@ -616,11 +625,11 @@ resultRelInfo->ri_forPortionOf->fp_targetRange = targetRange;
 Notes:
 
 - Here is a bit of what we do to init our ForPortionOfState.
+  - So we're not running the row-by-row update yet, just the node init.
 - We need to evaluate the FROM and TO parameters and turn those into a range.
-  - These are allowed to be functions like `NOW()` or arithmetic like `NOW() + INTERVAL '1 day'`.
+  - In general we expect to get constants here.
+  - They are also allowed to be functions like `NOW()` or arithmetic like `NOW() + INTERVAL '1 day'`.
 - Then as we update each row we can use range functions to see if the old row covered any time that should not be updated.
-  - The SQL:2011 standard says when we update the original row we should force the start/end bounds to the period targeted by FOR PORTION OF . . .
-  - and then implicitly INSERT up to two new rows to preserve the "leftovers" the UPDATE didn't target.
 - The TO & FROM can't change row-by-row, so the Init step is a good place to build our range.
 - We already constructed the expression tree in the analysis phase.
 - Now we evaluate it.
@@ -629,7 +638,7 @@ Notes:
 
 # Executor
 
-```c
+```c [|3-5|9-11|12-14]
 /* Initialize slot for the existing tuple */
 
 resultRelInfo->ri_forPortionOf->fp_Existing =
@@ -644,7 +653,6 @@ resultRelInfo->ri_forPortionOf->fp_Leftover1 =
 resultRelInfo->ri_forPortionOf->fp_Leftover2 =
     ExecInitExtraTupleSlot(mtstate->ps.state, tupDesc,
                            &TTSOpsVirtual);
-
 ```
 
 Notes:
@@ -656,6 +664,11 @@ Notes:
   - one for the row we just updated,
   - two for the "leftover" rows we want to insert:
     - one for the time before the target range, one after.
+- I'm going to say much more about TupleTableSlots in a moment,
+  - but here just see what we're doing:
+  - (highlight) we make the first one with `table_slot_create`.
+  - (highlight) we make the second one with `ExecInitExtraTupleSlot`.
+  - (highlight) we make another one with `ExecInitExtraTupleSlot`.
 
 
 
@@ -665,7 +678,7 @@ Notes:
 ExecutorRun
   ExecutePlan
     for (;;) {
-      slot = node->ExecProcNode(node);
+      TupleTableSlot *slot = node->ExecProcNode(node);
       if (TupIsNull(slot))
           break;
     }
@@ -680,10 +693,12 @@ Notes:
 - And that calls ExecProcNode, which is the partner of ExecInitNode, which we saw above.
   - ExecProcNode is a tiny inline function that calls the node's function pointer.
   - We call it over & over, and each time it processes one row and returns the result.
-  - The result is a `TupleTableSlot` (highlight): like a just saw!
+  - The result is a `TupleTableSlot`: like we just saw!
   - If the node has children, somewhere in its proc function it calls the proc function for those children too.
     - For instance maybe you have a node to do a NestedLoop, which you've probably seen in `EXPLAIN` output.
       - It needs the rows from its inner & outer relations, so it calls the proc function for those nodes.
+      - It doesn't care what kind of nodes those are.
+        It calls `ExecProcNode` which runs the function pointer.
     - So we've got this whole tree of proc functions passing around tuples.
   - Incidentally using function pointers makes it easy to inject instrumentation.
     - I haven't checked but I'm betting that's how `EXPLAIN ANALYZE` works.
@@ -692,7 +707,7 @@ Notes:
 
 # Executor
 
-```text
+```text [|2|5-8]
 for (;;) {
   context.planSlot = ExecProcNode(subplanstate);
   if (TupIsNull(context.planSlot)) break;
@@ -709,6 +724,7 @@ Notes:
 - Here are some bits from ExecModifyTable.
   - We use this same node for INSERT, UPDATE, DELETE, and MERGE.
 - You can see we're calling the proc function of our subplan to get rows (highlight),
+  - This is the row we want to update, or delete, or insert.
 - and then we call a function for the specific operation we want (highlight).
 - ExecUpdate will call ExecUpdatePrologue, ExecUpdateAct, and ExecUpdateEpilogue.
 
@@ -716,7 +732,7 @@ Notes:
 
 # Executor
 
-```c
+```c [|1-2|3-4|6-8]
 RangeType *oldRange = slot_getattr(oldtupleSlot,
         forPortionOf->rangeVar->varattno, &isNull);
 RangeType *targetRange = DatumGetRangeTypeP(
@@ -729,23 +745,24 @@ range_leftover_internal(typcache,
 
 Notes:
 
-- If the UPDATE (or DELETE) had a FOR PORTION OF clause,
-  then we call an ExecForPortionOf function.
-- It gets the row's old range value.
-- It gets the target range that we set up above.
-- It finds out if there are any leftovers to the left or right.
-  - There are more `RangeType` pointers.
+- The Epilogue is where we stick in our new code.
+  - Recall that if the UPDATE or DELETE had any leftovers, we need to insert records for that.
+- All this happens in a new function called ExecForPortionOf.
+- It gets the row's old range value (highlight).
+- It gets the target range that we set up above (built from the FROM & TO phrases) (highlight).
+- And it finds out if there are any leftovers to the left or right (highlight)
+  - These leftover variables get set. They're more `RangeType` pointers.
 
 
 
 # Executor
 
-```c
+```c [|3-4|5|7-9|11-12|]
 if (!RangeIsEmpty(leftoverRangeType1))
 {
-  MinimalTuple oldtuple = ExecFetchSlotMinimalTuple(
-          oldtupleSlot, NULL);
-  ExecForceStoreMinimalTuple(oldtuple, leftoverTuple1, false);
+  HeapTuple oldtuple = ExecFetchSlotHeapTuple(
+          oldtupleSlot, false, NULL);
+  ExecForceStoreHeapTuple(oldtuple, leftoverTuple1, false);
 
   set_leftover_tuple_bounds(leftoverTuple1, forPortionOf,
                             typcache, leftoverRangeType1);
@@ -759,18 +776,20 @@ if (!RangeIsEmpty(leftoverRangeType1))
 Notes:
 
 - And now if either of those leftover ranges are non-empty,
-- it takes the pre-update values from oldtuple,
-  copies them into our leftover TupleTableSlot,
-  changes the start/end values,
-  and does an Insert with it.
-- This is for leftoverRangeType1 but there is similar code for the other side.
+- it takes the pre-update values from oldtuple (highlight),
+  copies them into our leftover TupleTableSlot (highlight),
+  changes the start/end values (highlight),
+  and does an Insert with it (highlight).
+- This (highlight for all) is for leftoverRangeType1 but there is similar code for the other side.
   In fact I should probably move this into a little helper function.
+- All this work uses TupleTableSlots,
+  so let me talk about those, and then I'll run through this code again more slowly.
 
 
 
 # Tuple Table Slots
 
-```c
+```c [|3|8-9|7|10|6]
 typedef struct TupleTableSlot
 {
     NodeTag     type;
@@ -800,16 +819,17 @@ Notes:
 
 - You can see we've got a list of `Datum`s and null flags (highlight).
   - Every other intro to Postgres talks about Datums, so I've kind of shied away from giving you lots of details here.
-  - But basically a Datum is a single value: maybe of a row attribute, or an evaluated expression, or whatever.
-  - It doesn't matter what type the data is.
-  - There are functions and macros to cover them to/from concrete types, e.g. `DatumGetInt64` or `Int64GetDatum`.
+  - But basically a Datum is a single value: maybe from a column, or an evaluated expression, or whatever.
+    - If you write your own C functions you get Datums in and send a Datum out.
+    - It doesn't tell you what type of data it's holding.
+  - Then there are functions and macros to convert them to/from concrete types, e.g. `DatumGetInt64` or `Int64GetDatum`.
     - If the type is something small enough to be pass-by-value, this should be just a cast.
     - Otherwise the `Datum` is a pointer and might be TOASTed, so `DatumGetFoo` will also de-toast it for you.
-    - If you have written any custom C functions, you've worked with `Datum`s before.
     - Lots of links in my references have more details.
 
-- These two arrays basically *are* the tuple, but the TupleTableSlot lets us easily pass around other important information *about* the tuple.
+- So these two arrays let us get at the data in the tuple, but there's lots more info here *about* the tuple.
   - For example the tuple descriptor (highlight), which tells us how many attributes there are and what their types are---or actually the whole `pg_attribute` record if possible.
+  - Or the memory context (highlight), etc.
 
 - Now there are four kinds of TupleTableSlot:
   - You see this `tts_ops` field (highlight).
@@ -819,18 +839,115 @@ Notes:
 
 
 # Tuple Table Slots
-## TTSOpsBufferHeapTuple
+## `TTSOpsHeapTuple`
 
-```text
-ExecStoreBufferHeapTuple
+```c [|4|5]
+typedef struct HeapTupleTableSlot
+{
+    pg_node_attr(abstract)
+    TupleTableSlot base;
+    HeapTuple   tuple;          /* physical tuple */
+    uint32      off;            /* saved state for slot_deform_heap_tuple */
+    HeapTupleData tupdata;      /* optional workspace for storing tuple */
+} HeapTupleTableSlot;
 ```
 
 Notes:
 
+- So let's start with HeapTupleTableSlots.
+- Here is our C-style inheritance: we're a subclass of TupleTableSlot (highlight).
+- We have this reference to a HeapTable (highlight).
+  - That's defined in access/htup.h.
+  - It's got the memory that actually holds the tuple data.
+  - A HeapTupleTableSlot points to palloc'd memory, so that's what's in there.
+- If you want to read what's in there, you can call `slot_getattr`.
+  - That will give you the corresponding Datum/null value.
+  - Actually `slot_getattr` calls one of the 'ops function pointers.
+    For heap slots, it's going to pull the data out of this `HeapTuple`
+    and cache it in the Datum/isnull arrays we saw earlier.
+
+
+
+# Tuple Table Slots
+## `TTSOpsHeapTuple`
+
+```c [1-2]
+RangeType *oldRange = slot_getattr(oldtupleSlot,
+        forPortionOf->rangeVar->varattno, &isNull);
+RangeType *targetRange = DatumGetRangeTypeP(
+        resultRelInfo->ri_forPortionOf->fp_targetRange);
+
+range_leftover_internal(typcache,
+        oldRangeType, targetRangeType,
+        &leftoverRangeType1, &leftoverRangeType2);
+```
+
+Notes:
+
+- So jumping back to the code in our Init node,
+  we're calling `slot_getattr` on the pre-update tuple slot.
+
+
+
+# Tuple Table Slots
+## `HeapTuple`
+
+```c [1-3|6]
+HeapTuple perTuple = SearchSysCache2(PERIODNAME,
+                                     ObjectIdGetDatum(relid),
+                                     PointerGetDatum(range_name));
+if (HeapTupleIsValid(perTuple))
+{
+    Form_pg_period per = (Form_pg_period) GETSTRUCT(perTuple);
+    Oid rngtypid    = per->perrngtype;
+    int start_attno = per->perstart;
+    int end_attno   = per->perend;
+    . . .
+    ReleaseSysCache(perTuple);
+}
+```
+
+Notes:
+
+- While we're talking about HeapTuples, remember this?
+- Back when we called syscache, we were getting HeapTuples!
+  - This isn't a slot, which are just things to help out the executor.
+  - This is just the tuple.
+- And back there we used `GETSTRUCT`
+  - which just follows the pointer to the real tuple data and casts it to a struct.
+  - That works for catalog tables because we have compile-time structs for them.
+  - For ordinary user tables we use `slot_getattr`.
+
+
+
+# Tuple Table Slots
+## `TTSOpsBufferHeapTuple`
+
+```c
+typedef struct BufferHeapTupleTableSlot
+{
+    pg_node_attr(abstract)
+
+    HeapTupleTableSlot base;
+
+    Buffer      buffer;         /* tuple's buffer, or InvalidBuffer */
+} BufferHeapTupleTableSlot;
+```
+
+Notes:
+
+- Now here's a next type of TupleTableSlot: A BufferHeapTupleTableSlot.
+- Whereas a HeapTupleTableSlot is stored in palloc'd memory, a BufferHeapTupleTableSlot is stored in our disk buffer.
+- In fact the HeapTuples you get from syscache are examples of this.
+- For these tuples we need to take & release buffer pins, not alloc & free memory.
+- Looking at tuples in the buffer cache is sort of the normal case,
+  but this is maybe the most complicated.
+  You can see it's a "subclass" of `HeapTableTableSlot`, just with a pointer to its buffer.
+
+- The executor will use these all over the place.
+- It sort of helps explain why we have TupleTableSlots in the first place.
 - Suppose you're a SeqScan Node.
   - Your Init function sets up a TupleTableSlot to hold the rows you're going to return.
-  - Maybe you have another one if you have to do any projections.
-    - You know what I mean by projection? Like concat `first_name` and `last_name`.
   - Then in your proc node you're asking an Access Method for the tuples from the table or index,
     and you call `ExecStoreBufferHeapTuple` to put it into your TupleTableSlot.
     - So that puts a pin in the buffer page (so it doesn't go away),
@@ -839,47 +956,75 @@ Notes:
 
 
 # Tuple Table Slots
-## TupleTableSlot: TTSOpsHeapTuple
-
-Notes:
-
-- A HeapTuple slot points to palloc'd memory instead of a buffer page.
-- So instead of releasing a pin when we're done, we want to free the memory.
-- For both of these TupleTableSlots, you can pull the data out into the Datum and isnull arrays and work with it.
-  - If the Datum is pass-by-reference, it just points into the tuple data.
-
-
-
-# Tuple Table Slots
-## TTSOpsMinimalTuple
-
-```c
-/* Get the range of the existing pre-UPDATE/DELETE tuple */
-
-if (!table_tuple_fetch_row_version(
-      resultRelInfo->ri_RelationDesc, tupleid,
-      SnapshotAny, oldtupleSlot))
-  elog(ERROR, "failed to fetch tuple for FOR PORTION OF");
-
-oldRange = slot_getattr(oldtupleSlot,
-                        forPortionOf->rangeVar->varattno,
-                        &isNull);
-```
+## `TTSOpsMinimalTuple`
 
 Notes:
 
 - A minimal tuple is like a palloc'ed tuple, but it has no system columns.
-- We use this to hold the old version of the row being UPDATEd or DELETEd.
+  - There is also a header struct that we leave out here.
+- You might use this for computed tuples that don't come from disk.
+- I looked around to see where we use this:
+  - hash joins
+  - aggregate with GROUP BY
+- I don't have too much to say here.
+- It's like a HeapTupleTableSlot, but when we don't need the extra stuff from a physical tuple.
 
 
 
 # Tuple Table Slots
 ## `TTSOpsVirtual`
 
-```c [|1-3|5-7|9-10]
-MinimalTuple oldtuple = ExecFetchSlotMinimalTuple(
-    oldtupleSlot, NULL);
-ExecForceStoreMinimalTuple(oldtuple, leftoverTuple1, false);
+```c [|7-14||5|10,13]
+/* Initialize slot for the existing tuple */
+
+resultRelInfo->ri_forPortionOf->fp_Existing =
+    table_slot_create(resultRelInfo->ri_RelationDesc,
+                      &mtstate->ps.state->es_tupleTable);
+
+/* Create the tuple slots for INSERTing the leftovers */
+
+resultRelInfo->ri_forPortionOf->fp_Leftover1 =
+    ExecInitExtraTupleSlot(mtstate->ps.state, tupDesc,
+                           &TTSOpsVirtual);
+resultRelInfo->ri_forPortionOf->fp_Leftover2 =
+    ExecInitExtraTupleSlot(mtstate->ps.state, tupDesc,
+                           &TTSOpsVirtual);
+```
+
+Notes:
+
+- The last type of TupleTableSlot is Virtual.
+- This doesn't have its own tuple storage.
+  - It can be a nice optimization to prevent copying.
+  - Going back to our SeqScan node, it's going to pass its results to the parent node,
+    and maybe it will put them into its own TupleTableSlot.
+    - VirtualTupleTableSlots are great for this.
+- Also unlike the other types, the Datum/isnull arrays are the authoritative data:
+  - You can set them, and then do something with the tuple (like insert it).
+
+- So here (highlight) we are making a couple virtual TupleTableSlots for our leftovers.
+- It's interesting to ask why this is different from the slot just above (highlight)?
+  - Well `table_slot_create` will give us a tuple slot that matches the Relation you pass in---
+    it should be a BufferHeapTupleTableSlot.
+  - For the leftovers we want a Virtual one.
+  - In all cases the tuple descriptor matches the table we're updating.
+    - The lower functions need us to pass that in by hand.
+      - That's tupDesc here.
+    - But `table_slot_create` gets the descriptor automatically off the Relation struct.
+  - Finally where do these slots go? In the tuple table!
+    - At the top you see us pass the tuple table (highlight), which is part of the top-level executor state.
+      - That's a List node and the slot gets appended there.
+    - In the bottom we're also passing the executor state, and those functions add the slot to the same list.
+
+
+
+# Tuple Table Slots
+## `TTSOpsVirtual`
+
+```c [|1-2|3|5-6|7|9-10|11-12]
+HeapTuple oldtuple = ExecFetchSlotHeapTuple(
+        oldtupleSlot, false, NULL);
+ExecForceStoreHeapTuple(oldtuple, leftoverTuple1, false);
 
 set_leftover_tuple_bounds(leftoverTuple1, forPortionOf,
                           typcache, leftoverRangeType1);
@@ -891,26 +1036,33 @@ ExecInsert(context, resultRelInfo, leftoverTuple1,
 
 Notes:
 
-- A virtual TupleTableSlot doesn't own its own tuple memory.
-- The Datum and isnull arrays are the authoritative data.
-- Using these can prevent copying between plan nodes.
-- We use these to store the new rows for "leftovers" untouched by the `FOR PORTION OF`.
-- Here (highlight) we take the old version of the row and copy it into our virtual tuple.
-- Then (highlight) we compute the new start/end times
-  and mark the tuple as "ready".
-  - `ExecMaterializeSlot` basically marks the tuple as "ready".
-  - TODO: no! For other tuple types is copies the data into the Datum and isnull arrays.
-- And then we can ask this tuple to be inserted.
+- Okay so we've got our tuple table slots,
+  and here is our code again that actually does something with them.
+- Here (highlight) we pull out the old version of the row.
+  This should just hand us back the reference, 
+  but if we said `true` instead of `false` it would materialize the tuple
+  which guarantees the slot "owns" the tuple, basically by making its own copy.
+  We're about to copy it anyway, so we don't need that.
+- Here (highlight) we copy it into our virtual tuple.
+  - This sets the Datum/isnull arrays.
+  - But if some Datums are pass-by-reference, they still point back into the HeapTuple.
+- Then (highlight) we compute the new start/end times.
+  - This is going to put a different range into our Datum array.
+    - Or if we've got a PERIOD, it will update the Datums for the start/end columns.
+  - And last (highlight) `ExecMaterializeSlot` makes the tuple "ready".
+    For a virtual slot, it looks at all the Datums,
+    and whichever are pass-by-reference, it copies them into the slot's memory context.
+  - So now we've got our own tuple that isn't pointing into someone else's space.
+- And that means we can insert it.
 
 
 
-# TODO
+# Thank You!
 
-ExecInitNullTupleSlot
-ExecInitResultTupleSlotTL
-ExecInitExtraTupleSlot
-MakeSingleTupleTableSlot
-MakeTupleTableSlot
+Notes:
+
+- Okay, that's the end of our journey.
+  Thank you for listening. Here are some references (highlight).
 
 
 
@@ -932,3 +1084,12 @@ MakeTupleTableSlot
 1. Tom Lane, *Re: [HACKERS] [PROPOSAL] Temporal query processing with range types*, pgsql-hackers mailing list, 2017. https://www.postgresql.org/message-id/32265.1510681378@sss.pgh.pa.us
 
 1. Robert Haas, *Re: MERGE SQL statement for PG12*, pgsql-hackers mailing list, 2019. https://www.postgresql.org/message-id/CA%2BTgmoZj8fyJGAFxs%3D8Or9LeNyKe_xtoSN_zTeCSgoLrUye%3D9Q%40mail.gmail.com
+
+1. Paul Jungwirth, https://github.com/pjungwir/pgcon-2023-talk-exec-phase
+
+Notes:
+
+- I learned a ton from these other talks and articles.
+- I know I skipped a lot of stuff, but that's because they cover it so well already.
+- You can also find this talk's github repo on there.
+- Now I'm happy to answer questions or accept corrections!
