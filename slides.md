@@ -1,4 +1,4 @@
-# Postgres Pipeline: Esp Emph Exec
+# Postgres Pipeline: Especially Emphasizing Executor
 
 by Paul Jungwirth
 
@@ -122,7 +122,7 @@ On Tue, Nov 14, 2017 at 9:43 AM Tom Lane <tgl@sss.pgh.pa.us> wrote:
 
 Notes:
 
-- Why do all these phase matter?
+- Why do all these phases matter?
   - I've noticed several patches being rejected because they do their work in the wrong phase.
     - There was a really cool temporal patch a few years ago that did nearly everything in the analysis phase. This quote is from that patch.
     - Early versions of the MERGE command patch were rejected with similar feedback.
@@ -210,7 +210,7 @@ Notes:
 - The big bison file is `gram.y`.
   - This defines the SQL grammar.
   - Here is a quote from it for the FOR PORTION OF clause.
-  - When bishop sees the symbols in the rule, it runs the C code below.
+  - When bison sees the symbols matching the rule, it runs the C code below.
 - You can see a call to makeNode.
   - Parsing contructs a big parse tree made of these nodes.
   - Nodes are what flow through the pipeline.
@@ -319,12 +319,52 @@ Notes:
   - Here we can consult the database schema to find oids, types, etc.
 - It will transform your parse nodetree (here an UpdateStmt) into a Query nodetree.
   You can see the top-level result node will be Query (highlight).
-  So we're already starting to build plan nodes.
   The parse nodes should just capture what the user typed, as plainly as possible.
 - So the first thing we're doing is looking up the table to update (highlight).
 - Next if there was a `FOR PORTION OF` we translate that into plan nodes (highlight).
+  - We feed in a `ForPortionOfClause`, we get back a `ForPortionOfExpr`, which is a different struct
+    - with attribute numbers of the range or start/end columns,
+    - also an Expression node turning the FROM & TO phrases into a range.
+    - I'm not going to show all those details today though.
 - Lots of the analysis work happens in functions named `transformThis` and `transformThat`,
   like here we process a `FROM` if there was one.
+  - Btw do you notice we aren't getting a return value here?
+    - But we *are* passing in the top-level parse state....
+
+
+
+# RangeTblEntry
+
+```c
+typedef struct RangeTblEntry
+{
+    NodeTag     type;
+
+    RTEKind     rtekind;        /* see above */
+    Oid         relid;          /* OID of the relation */
+    char        relkind;        /* relation kind (see pg_class.relkind) */
+    int         rellockmode;    /* lock level that query requires on the rel */
+    Index       perminfoindex;
+    Query      *subquery;       /* the sub-query */
+    /* . . . */
+```
+
+Notes:
+
+- Something you use all over the place are `RangeTblEntry`s.
+- The Query struct has a List called `rtable`,
+  which holds a bunch of these structs.
+  - When we process the FROM clause we're adding to that list.
+- A range table is:
+  1. not a database table (i.e. not a relation).
+  2. has nothing to do with range types.
+- It's a table as in a list of structs.
+- Each struct is a quote-unquote range: which is basically a relation:
+  - either a true persisted table,
+  - or the result of a subquery or join,
+  - or some other more exotic thing.
+- So when your query joins a bunch of tables or subqueries, each FROM entry is a RangeTbl*Entry*: an entry in the range table.
+
 
 
 
@@ -350,6 +390,7 @@ if (HeapTupleIsValid(perTuple))
 
 Notes:
 
+- Another thing you see all over the place are all these caches.
 - Syscache lets you look things up in the system catalog tables.
 - We call it a lot in analysis,
   so this seems like a good place to cover it.
@@ -357,10 +398,11 @@ Notes:
 - You see we're calling `SearchSysCache2`.
   This is defined in `utils/cache/syscache.c`.
   We give it the cache name, here `PERIODNAME`. That determines the table to query, the index the use, and how big the cache should be.
-  This is search *2* because we search based on two attributes. Here the relation id (i.e. the table), and the period name. So those are the other arguments.
+  This is search *2* because we search based on two attributes. Here the relation id (i.e. the table), and the period name. That uniquely identifies a PERIOD. So those are the other arguments you see.
 - We don't necessarily get a result (highlight), so we have to check if we got something,
   and maybe report an error if not.
 - Then we cast the `HeapTuple` to a struct matching the `pg_period` table.
+  - (pause) This line is kind of amazing actually.
 - For simple types like ints and oids you can just pull them off the struct (highlight).
 - When you're done you call `ReleaseSysCache` (highlight).
   - This isn't freeing memory but decrements a reference count
@@ -373,8 +415,7 @@ Notes:
   so we look that up too.
 - For the range type we have a nice helper function, typeidType.
   This is just defined with the parser code.
-  A `Type` is just a typedef'd `HeapTuple`, so we have to free that the same way.
-- Since it's really a HeapTuple, we free it the same way (highlight).
+  In fact a `Type` is just a typedef'd `HeapTuple`, so we have to free that the same way (highlight).
 - Another helpful function here is `typeTypeName`,
   which gives us a C-string for the type.
 
@@ -408,6 +449,8 @@ Notes:
 - It's common to call these during analysis, but really they're called anywhere.
 - Here is a helper function I added.
 - This is used by the foreign key triggers.
+- Typically you use syscache if you need a bunch of things from the catalog row,
+  and if you only need one thing (like a name or the oid) you use an lsyscache helper.
 
 
 
@@ -425,7 +468,7 @@ dst->fp_targetRange = datumCopy(src->fp_targetRange,
 
 Notes:
 
-- And then one more cache you will surely use is the typcache.
+- And then the last cache you will surely use is the typcache.
 - Types and operators are so important they have their own cache and helper functions.
   Not only do we need them to do almost anything,
   their info tends to be spread across a lot of tables, not just `pg_type`,
@@ -435,45 +478,11 @@ Notes:
   I mean int is never going out of style, right?
   So a `TypeCacheEntry` is never freed.
   This saves a lot of work---both for Postgres and for you.
-  I guess you don't want to operationally redefine types, because you'd be leaking memory.
+  I guess if you built an application that operationally redfined typed,
+  you'd be leaking a lot of memory, but also you'd be crazy.
 - The typcache has some functions for domains and enums, but the only really essential function is `lookup_type_cache` (highlight).
   - A `TypeCacheEntry` is a big struct with lots of info, and you might not want all of it, so you can use constants like `TYPECACHE_RANGE_INFO` to say what you care about.
   - Here (highlight) we are using the type's size and whether it's pass-by-value to make a copy of a range.
-
-
-
-# RangeTblEntry
-
-```c
-typedef struct RangeTblEntry
-{
-    NodeTag     type;
-
-    RTEKind     rtekind;        /* see above */
-    Oid         relid;          /* OID of the relation */
-    char        relkind;        /* relation kind (see pg_class.relkind) */
-    int         rellockmode;    /* lock level that query requires on the rel */
-    Index       perminfoindex;
-    Query      *subquery;       /* the sub-query */
-    /* . . . */
-```
-
-Notes:
-
-- The last thing from analysis I want to talk about is `RangeTblEntry`.
-- The Query struct has a List called `rtable`,
-  which holds a bunch of these structs.
-  - We use this everywhere.
-- A range table is:
-  1. not a database table (i.e. not a relation).
-  2. has nothing to do with range types.
-- It's a table as in a list of structs.
-- Each struct is a quote-unquote range: which is basically a relation:
-  - either a true persisted table,
-  - or the result of a subquery or join,
-  - or some other more exotic thing.
-- So when your query joins a bunch of tables or subqueries, each FROM entry is a RangeTbl*Entry*: an entry in the range table.
-
 
 
 
@@ -524,7 +533,7 @@ Notes:
       - They have the attribute number and some other info.
     - In other contexts they might be columns to SELECT, etc.
     - Our `forPortionOfExpr` has a list of TLEs for the implicitly-set columns, separate from the ones the user sets explicitly. (highlight)
-  - In you have an updatable view, we need to convert our TLE from the view's attno to the underlying table's.
+  - In you have an updatable view, we need to convert our TLE from the view's attno to the underlying table's (highlight).
 - So I'm not saying much about rewriting, but TLEs are something you'll see elsewhere too, and this is a good excuse to mention them.
 
 
@@ -536,14 +545,16 @@ Notes:
 Notes:
 
 - For each Query node the planner returns a PlannedStmt node.
+  - So now we're transitioning from parse nodes to plan nodes.
 - For each base relation the planner will generate several "Paths"
   then choose the best one: maybe a full-table scan, maybe an index scan, maybe a bitmap index scan.
 - Also for each pair of joined relations the planner will generate Paths to implement the join.
   - One relation is the the outer and the other the inner.
   - It will consider a nested loop join, a hash join, etc.
 - So all these paths get an estimated cost, and the planner chooses the best one.
-- When I worked on multiranges I had to do some work to collect statistics about them and use those to make selectivity estimates.
-- Okay that's all I know about the planner!
+- I haven't done much here.
+  - When I worked on multiranges I had to do some work to collect statistics about them and use those to make selectivity estimates.
+  - And that's all I know about the planner!
 
 
 
@@ -574,13 +585,18 @@ Notes:
 - But the portal functions call ExecutorStart and ExecutorRun (highlight).
 - ExecutorStart (highlight) sets up . . . another node tree.
   - `CreateExecutorState` creates an EState struct which has info about the overall execution.
-  - Most plan nodes require some mutable state to execute, so each of them gets a sibling execState node.
-  - ExecInitNode knows how to create the right execState for each kind of plan node.
+  - Most plan nodes require some mutable state to execute, so each of them gets a corresponding execState node.
+    - They are like counterparts.
+    - You can imagine these parallel trees.
+    - So we have to call ExecInitModifyTable and ExecInitThis and ExecInitThat.
+  - ExecInitNode knows which init function to call for each kind of plan node.
     - Basically it's a big switch statement.
-    - Then those functions it calls recursively call the right ExecInit function for their own children,
+    - Then whatever it calls recursively calls the right init function for its own children,
       and so on.
       Or maybe they call ExecInitNode again.
         - That's what ExecInitModifyTable does to set up its source of tuples to insert/update/delete.
+          - It doesn't care the specific node type that is giving it tuples,
+            so it lets ExecInitNode dispatch for it.
 - And then `ExecutorRun` (highlight) actually does the work.
 - There are `ExecutorFinish` and `ExecutorEnd`
   as well as node-specific end functions, but I'm going to skip those.
@@ -605,6 +621,7 @@ Notes:
 - Here is the "abstract superclass" for our execState nodes.
 - Each one has a type, just like any node (highlight)
 - Each gets a reference to its plan node (highlight).
+  - That's it's counterpart.
   - Whereas the execState is mutable, the plan node is stable for the whole executor phase.
 - They all reference the top-level EState struct (highlight).
 - They also each reference a function to process their kind of executor node (highlight).
@@ -627,12 +644,11 @@ Notes:
 - Here is a bit of what we do to init our ForPortionOfState.
   - So we're not running the row-by-row update yet, just the node init.
 - We need to evaluate the FROM and TO parameters and turn those into a range.
+  - The TO & FROM can't change row-by-row, so we can do it up front here.
+  - We built this expression back in the analysis phase;
+    now is our chance to evaluate it.
   - In general we expect to get constants here.
   - They are also allowed to be functions like `NOW()` or arithmetic like `NOW() + INTERVAL '1 day'`.
-- Then as we update each row we can use range functions to see if the old row covered any time that should not be updated.
-- The TO & FROM can't change row-by-row, so the Init step is a good place to build our range.
-- We already constructed the expression tree in the analysis phase.
-- Now we evaluate it.
 
 
 
@@ -810,12 +826,12 @@ Notes:
 - So what are these TupleTableSlots anyway?
 - If you're working in the executor you'll probably need to use one.
 - I couldn't find any talk or article talking about these things.
-- The place to look is `executor/tuptable.h`.
+- Fortunately the Postgres source has great comments, and most directories have a README.
 - Of course a tuple is more-or-less a row.
 - A "tuple table" is how the executor deals with processing tuples.
   - It's a table like the Range Table is a table: a list of structs.
   - Each tuple is kept in a TupleTableSlot.
-  - Guess what? This is a node too (highlight)! But you don't really mix it with other nodes.
+  - Guess what? This is a node too (highlight)! Lots of the execState nodes have these as members.
 
 - You can see we've got a list of `Datum`s and null flags (highlight).
   - Every other intro to Postgres talks about Datums, so I've kind of shied away from giving you lots of details here.
@@ -1067,7 +1083,7 @@ Notes:
 
 
 # References
-<!-- .slide: style="font-size: 50%; text-align: left" class="bibliography" -->
+<!-- .slide: style="font-size: 45%; text-align: left" class="bibliography" -->
 
 1. Selena Deckelmann, *So, you want to a developer*, 2011. https://wiki.postgresql.org/wiki/So,_you_want_to_be_a_developer%3F
 
