@@ -1,4 +1,4 @@
-# Postgres Pipeline: Especially Emphasizing Executor
+# Postgres Pipeline: Especially Emphasizing Execution
 
 by Paul Jungwirth
 
@@ -12,13 +12,14 @@ Notes:
 - I do independent consulting & development through my company Illuminated Computing.
 - When I'm lucky I get to do Postgres work.
 - I've been a minor contributor since 2016.
-  - I added multiranges a while back,
+  - I worked on multiranges,
   - and since then I've been working on adding SQL:2011 temporal support.
 
 - As a newish contributor, I've often wished for a comprehensive guide to hacking on Postgres.
 - There are some great articles and talks out there already,
-  but one place I've never found much help is on the executor phase.
-- So this is my contribution to helping others pick up Postgres hacking.
+  but one place I've never found much help on is the executor phase.
+- So this is my contribution to helping others pick up Postgres hacking:
+  the bits I had to figure out on my own.
 
 
 
@@ -40,16 +41,16 @@ Notes:
   Build possible plan trees,
   Cost them and choose the best one,
   and finally run it!
-- I want to give the talk I wish I had when I was working temporal stuff.
 - There are lots of talks about writing custom C functions for Postgres,
   and lots about the parsing and analysis phases,
   but I could find very little about the execution phase---
   which is where the real work is supposed to happen.
 - So I'm going to rush a bit through the early phases
   so I can talk more about executor nodes, tuple table slots, etc.
-- This talk will probably be a bit desultory,
-  but I hope following the pipeline structure will help a bit.
-- I want to also use my temporal work as a running example.
+- It's going to be desultory and digressive,
+  but I hope two things will help:
+  - I'm going to follow this pipeline structure,
+  - and I'll use my temporal work as a running example.
 
 - Of course PGCon is like the riskiest place to give a talk like this.
   - Here I am a Postgres dilettante you are all the real experts.
@@ -74,18 +75,18 @@ FOREIGN KEY (id, PERIOD valid_at)
 
 Notes:
 
-- Hopefully my temporal work will help make things concrete and motivated.
+- Here's the temporal stuff I'll use to keep things concrete.
 - There are four parts:
   - (higlight) adding a PERIOD (which is a bit like a range but not a true column).
   - (highlight) adding a temporal primary key or unique constraint (which includes a PERIOD or (in Postgres) a range column).
   - (highlight) running a temporal UPDATE/DELETE, which targets just a span of time and leaves the other times untouched.
   - (highlight) adding a temporal foreign key.
 - (highlight) Mostly I'll talk about `FOR PORTION OF`, because that's the most "interesting" command here.
-  - Basically SELECT and DML commands go through the full query pipeline.
-  - Whereas DDL are "utility commands" and get more direct treatment.
+  - DDL commands are just "utility commands" and skip most of this pipeline.
     - They are still parsed & analyzed ...
       but then we don't build up a plan or a tree of executor nodes.
       We just do it.
+  - But SELECT and DML get the full experience.
 
 
 
@@ -98,6 +99,7 @@ Notes:
 - Here is a quick visualization of what FOR PORTION OF does.
   - The SQL:2011 standard says when we update the original row we should force the start/end bounds to the period targeted by FOR PORTION OF . . .
   - and then implicitly INSERT up to two new rows to preserve the "leftovers" the UPDATE didn't target.
+  - The leftovers are green because they match the pre-update data.
   - By the way this is the only picture you get in this whole talk.
 
 
@@ -124,16 +126,18 @@ Notes:
 
 - Why do all these phases matter?
   - I've noticed several patches being rejected because they do their work in the wrong phase.
-    - There was a really cool temporal patch a few years ago that did nearly everything in the analysis phase. This quote is from that patch.
+    - There was a really cool temporal patch a few years ago that did nearly everything in the analysis phase. This quote is feedback on that patch.
     - Early versions of the MERGE command patch were rejected with similar feedback.
       - Robert Haas wrote an excellent review of that patch from 2019 giving specific reasons why you should do things in the right phase,
         as well as links to past feedback with yet more reasons.
         Robert and Tom's posts are both in the References at the end of my talk.
         I've been trying to find them again for years actually, but I could never get Google to give me what I wanted.
-        Finally for this talk I downloaded all the mbox files and searched them locally. (Sorry archive team!)
-        Now you can check them out yourselves!
+        Finally for this talk I downloaded all the mbox files and searched them locally.
+          - (Sorry about that!)
+          - But they are too good to get lost to obscurity.
+          - They should really get linked from the Postgres development wiki.
 
-  - Most commonly patches do too much upfront in analysis, but this has some problems:
+  - So what's wrong with doing your work in analysis?
     - When you describe a view, you won't get back the SQL you typed in.
     - The output from EXPLAIN will look funny.
       - Actually my own patch is maybe wrong here:
@@ -255,7 +259,7 @@ Notes:
 - You will also see a lot of List members.
   - A List is also a Node, but it's a node that has a bunch of other nodes.
   - There are functions to build them, iterate over them, append to them.
-  - When people say the Postgres is lispy, this is part of what they mean.
+  - When people say that Postgres is lispy, this is part of what they mean.
   - Actually a lightning talk on Postgres's Lisp history would be a lot of fun, if any of you are qualified to give that.
 
 - Nodes & Lists are well-covered by other talks, so if you want to know more check the references at the end.
@@ -448,7 +452,13 @@ Notes:
 - They call `ReleaseSysCache` for you so they are convenient.
 - It's common to call these during analysis, but really they're called anywhere.
 - Here is a helper function I added.
-- This is used by the foreign key triggers.
+  - This is used by the foreign key triggers.
+  - Basically everything in lsyscache looks like this:
+    - It searches the syscache,
+    - it pulls something off the struct
+    - it releases the tuple,
+    - it returns what it found.
+    - There is a convention to let the caller say whether or not to fail on missing data.
 - Typically you use syscache if you need a bunch of things from the catalog row,
   and if you only need one thing (like a name or the oid) you use an lsyscache helper.
 
@@ -478,8 +488,8 @@ Notes:
   I mean int is never going out of style, right?
   So a `TypeCacheEntry` is never freed.
   This saves a lot of work---both for Postgres and for you.
-  I guess if you built an application that operationally redfined typed,
-  you'd be leaking a lot of memory, but also you'd be crazy.
+  I guess if you built an application that operationally redfined types,
+  you'd be leaking a lot of memory, but also you'd be little crazy.
 - The typcache has some functions for domains and enums, but the only really essential function is `lookup_type_cache` (highlight).
   - A `TypeCacheEntry` is a big struct with lots of info, and you might not want all of it, so you can use constants like `TYPECACHE_RANGE_INFO` to say what you care about.
   - Here (highlight) we are using the type's size and whether it's pass-by-value to make a copy of a range.
@@ -956,6 +966,8 @@ Notes:
 - Whereas a HeapTupleTableSlot is stored in palloc'd memory, a BufferHeapTupleTableSlot is stored in our disk buffer.
 - In fact the HeapTuples you get from syscache are examples of this.
 - For these tuples we need to take & release buffer pins, not alloc & free memory.
+  - A pin says "Don't throw this buffer page away; I'm using it!"
+  - Like you're pinning it in place.
 - Looking at tuples in the buffer cache is sort of the normal case,
   but this is maybe the most complicated.
   You can see it's a "subclass" of `HeapTableTableSlot`, just with a pointer to its buffer.
@@ -966,7 +978,7 @@ Notes:
   - Your Init function sets up a TupleTableSlot to hold the rows you're going to return.
   - Then in your proc node you're asking an Access Method for the tuples from the table or index,
     and you call `ExecStoreBufferHeapTuple` to put it into your TupleTableSlot.
-    - So that puts a pin in the buffer page (so it doesn't go away),
+    - So that puts a pin in the buffer page,
       then it stores a pointer to the `HeapTuple` struct.
 
 
