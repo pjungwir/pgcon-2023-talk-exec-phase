@@ -42,8 +42,9 @@ Notes:
   Cost them and choose the best one,
   and finally run it!
 - There are lots of talks about writing custom C functions for Postgres,
-  and lots about the parsing and analysis phases,
-  but I could find very little about the execution phase---
+  and lots about the parsing and analysis phases.
+    - And those are a great place to start---probably better than this talk actually.
+  But I could find very little about the execution phase---
   which is where the real work is supposed to happen.
 - So I'm going to rush a bit through the early phases
   so I can talk more about executor nodes, tuple table slots, etc.
@@ -100,6 +101,7 @@ Notes:
   - The SQL:2011 standard says when we update the original row we should force the start/end bounds to the period targeted by FOR PORTION OF . . .
   - and then implicitly INSERT up to two new rows to preserve the "leftovers" the UPDATE didn't target.
   - The leftovers are green because they match the pre-update data.
+    (Except we changed the start/end times.)
   - By the way this is the only picture you get in this whole talk.
 
 
@@ -138,13 +140,16 @@ Notes:
           - They should really get linked from the Postgres development wiki.
 
   - So what's wrong with doing your work in analysis?
+    - For one thing you want to keep the codebase organized.
+      - But there are concrete reasons too.
     - When you describe a view, you won't get back the SQL you typed in.
     - The output from EXPLAIN will look funny.
-      - Actually my own patch is maybe wrong here:
+      - Actually my own patch maybe approaches the line:
         FOR PORTION OF adds a qual (a WHERE condition basically)
         restricting it to rows that match the targeted timeframe.
         I decided that showing that in EXPLAIN seeemed helpful,
         although technically it's not something the user typed.
+        No reviewers have complained about it yet.
         It may not always be appropriate though, depending on the feature.
 
   - At one point `FOR PORTION OF` was requiring a temporal PK (which was not really correct),
@@ -209,7 +214,8 @@ for_portion_of_clause:
 
 Notes:
 
-- Parsing & analysis are often grouped together.
+- Parsing & analysis are often discussed together.
+  - This is just parsing.
 - Postgres uses lex & yacc (or I should say flex & bison) to tokenize then parse your input, respectively.
 - The big bison file is `gram.y`.
   - This defines the SQL grammar.
@@ -245,7 +251,7 @@ typedef struct ForPortionOfClause
 
 Notes:
 
-- Here is a new node type: a ForPortionOfClause.
+- Here is a new type of parse node: a ForPortionOfClause.
 - There are big high-level nodes like SelectStmt,
 - down through clauses like GROUP BY or OVER,
 - and expressions made of operators, functions, literals, column references, etc.
@@ -254,7 +260,7 @@ Notes:
   to copy a node, to print a node, to read a node back from what was printed.
 - Until recently you had to write all these each time you added a node,
   but now there is some clever codegen that does it for you.
-  - There is some tree-walking code with big switch statements where you might need to handle your new node type.
+  - There is still some tree-walking code with big switch statements where you might need to handle your new node type.
 
 - You will also see a lot of List members.
   - A List is also a Node, but it's a node that has a bunch of other nodes.
@@ -286,12 +292,14 @@ So all these Nodes are getting allocated, right?
 This is C isn't it?
 Where do you think we free them?
 We don't!
+
 Postgres has an arena-based memory system.
 Arenas are nested and have lifetimes from very broad to more specific:
 For instance for the transaction, the current query, the function being called, the current row, etc.
 When a context ends, everything in it gets freed.
+
 To someone like me who writes a lot of Ruby and Python, this is awesome!
-Just the pleasure of writing C with totally insoucient memory management makes me want to do more Postgres.
+The delight of writing C with totally insoucient memory management makes me want to do more Postgres.
 
 
 
@@ -368,7 +376,6 @@ Notes:
   - or the result of a subquery or join,
   - or some other more exotic thing.
 - So when your query joins a bunch of tables or subqueries, each FROM entry is a RangeTbl*Entry*: an entry in the range table.
-
 
 
 
@@ -496,6 +503,72 @@ Notes:
 
 
 
+# Analysis
+
+```c [|4|5-8|9-10]
+Node *target_start = transformForPortionOfBound(
+        forPortionOf->target_start, true);
+Node *target_end   = transformForPortionOfBound(
+        forPortionOf->target_end, false);
+FuncCall *fc = makeFuncCall(SystemFuncName(range_type_name),
+              list_make2(target_start, target_end),
+              COERCE_EXPLICIT_CALL,
+              forPortionOf->range_name_location);
+result->targetRange = transformExpr(
+        pstate, (Node *) fc, EXPR_KIND_UPDATE_PORTION);
+```
+
+Notes:
+
+- Here we're building an expression from the targeted range:
+  the FROM and TO phrases.
+- We get the individual bounds as nodes. (highlight)
+  We almost don't need a separate function there,
+  but it does some work to support an `UNBOUNDED` keyword.
+- Next we make a function call node. (highlight)
+  This is calling a range constructor of the appropriate type,
+  passing in the bounds.
+- This `range_name_location` item you see is something we ask bison to set all over.
+  It helps us point to the right place if we need to report an error.
+- And finally we call transform on our node (highlight).
+  - One thing this does is make sure you aren't calling unsupported functions.
+  - For instance you can't run a subquery here,
+    or call a window function.
+- We stick this expression on our struct so we can use it later.
+
+
+
+# Analysis
+
+```c [|7-8]
+Expr *rangeSetExpr = (Expr *) makeSimpleA_Expr(
+        AEXPR_OP, "*", (Node *) copyObject(rangeExpr),
+        (Node *) fc, forPortionOf->range_name_location);
+rangeSetExpr = (Expr *) transformExpr(
+        pstate, (Node *) rangeSetExpr, EXPR_KIND_UPDATE_PORTION);
+
+TargetEntry *tle = makeTargetEntry(
+        rangeSetExpr, range_attno, range_name, false);
+targetList = lappend(targetList, tle);
+
+/* Mark the range column as requiring update permissions */
+target_perminfo->updatedCols =
+        bms_add_member(target_perminfo->updatedCols,
+                       range_attno - FirstLowInvalidHeapAttributeNumber);
+```
+
+Notes:
+
+- Here we've got some code to set the new bounds on the record.
+- We take the old bounds and intersect them with the targeted range.
+- You can see are making this TargetEntry or TLE. TLE for Target List Entry.
+- In an update query you have one of these for each column you're setting.
+  - In a select you use them for the SELECT'd columns.
+- Also we add it to the list of columns that need permission checks.
+- A TLE is a lot like an RangeTblEntry: one item in a List of structs.
+
+
+
 # Rewriting
 
 - `VIEW`s
@@ -536,15 +609,10 @@ Notes:
 - If your feature should work against a view, maybe you need to do something here.
 - This might also be a worthwhile place for doing things you aren't supposed to do in analysis.
 - For example with UPDATE FOR PORTION OF, we are implicitly setting the `PERIOD` start/end columns.
-  - The means we need `TargetEntry` nodes for those columns.
-  - An UPDATE has a list of TargetEntry nodes.
-    - Often these are called TLEs for "Target List Entry".
-    - Each of these represents a column to update.
-      - They have the attribute number and some other info.
-    - In other contexts they might be columns to SELECT, etc.
-    - Our `forPortionOfExpr` has a list of TLEs for the implicitly-set columns, separate from the ones the user sets explicitly. (highlight)
+  - As you saw we added `TargetEntry` nodes for those columns.
+  - Our `forPortionOfExpr` has a list of TLEs for the implicitly-set columns, separate from the ones the user sets explicitly. (highlight)
   - In you have an updatable view, we need to convert our TLE from the view's attno to the underlying table's (highlight).
-- So I'm not saying much about rewriting, but TLEs are something you'll see elsewhere too, and this is a good excuse to mention them.
+- That's it for rewriting.
 
 
 
@@ -556,10 +624,27 @@ Notes:
 
 - For each Query node the planner returns a PlannedStmt node.
   - So now we're transitioning from parse nodes to plan nodes.
-- For each base relation the planner will generate several "Paths"
+    - There is an "abstract superclass" Plan node.
+      - These are things you might recognize from EXPLAIN:
+      - Examples are Join, Sort, CteScan, etc.
+    - OTOH a lot of node types are shared between parsing & planning:
+      - RangeTblEntry
+      - TargetEntry
+      - Expression bits
+  - There is about one line in my patch here to copy my new struct from the parse tree to the plan tree.
+    - You could do more transformation at this stage if you like.
+  - The include files are nicely separated:
+    - nodes/primnodes.h - "primitive nodes", often shared by different phases
+    - nodes/parsenodes.h
+    - nodes/plannodes.h
+    - nodes/execnodes.h
+  - But you surely have to do something here to move your stuff over.
+
+- The real work of this phase is to find the best way to implement your plan.
+- For each table in your query the planner will generate several "Paths"
   then choose the best one: maybe a full-table scan, maybe an index scan, maybe a bitmap index scan.
 - Also for each pair of joined relations the planner will generate Paths to implement the join.
-  - One relation is the the outer and the other the inner.
+  - One relation is the outer and the other the inner.
   - It will consider a nested loop join, a hash join, etc.
 - So all these paths get an estimated cost, and the planner chooses the best one.
 - I haven't done much here.
@@ -595,8 +680,9 @@ Notes:
 - But the portal functions call ExecutorStart and ExecutorRun (highlight).
 - ExecutorStart (highlight) sets up . . . another node tree.
   - `CreateExecutorState` creates an EState struct which has info about the overall execution.
-  - Most plan nodes require some mutable state to execute, so each of them gets a corresponding execState node.
-    - They are like counterparts.
+  - Most plan nodes require some mutable state to execute, so each of them gets a corresponding PlanState node.
+      - The struct is called PlanState but I'll refer to them as executor nodes.
+    - Plan & PlanState are like counterparts.
     - You can imagine these parallel trees.
     - So we have to call ExecInitModifyTable and ExecInitThis and ExecInitThat.
   - ExecInitNode knows which init function to call for each kind of plan node.
@@ -628,11 +714,11 @@ typedef struct PlanState
 
 Notes:
 
-- Here is the "abstract superclass" for our execState nodes.
+- Here is what our executor nodes inherit from.
 - Each one has a type, just like any node (highlight)
 - Each gets a reference to its plan node (highlight).
   - That's it's counterpart.
-  - Whereas the execState is mutable, the plan node is stable for the whole executor phase.
+  - Whereas the PlanState is mutable, the Plan node is stable for the whole executor phase.
 - They all reference the top-level EState struct (highlight).
 - They also each reference a function to process their kind of executor node (highlight).
   - Later we'll chase these function pointers to do all the work.
@@ -652,7 +738,7 @@ resultRelInfo->ri_forPortionOf->fp_targetRange = targetRange;
 Notes:
 
 - Here is a bit of what we do to init our ForPortionOfState.
-  - So we're not running the row-by-row update yet, just the node init.
+  - Remember we're not running the row-by-row update yet, just the node init.
 - We need to evaluate the FROM and TO parameters and turn those into a range.
   - The TO & FROM can't change row-by-row, so we can do it up front here.
   - We built this expression back in the analysis phase;
@@ -687,7 +773,7 @@ Notes:
 - A TupleTableSlot is a place to hold a tuple.
   - We saw this briefly before.
 - We need a place for three tuples:
-  - one for the row we just updated,
+  - one for the old version of the row we just updated,
   - two for the "leftover" rows we want to insert:
     - one for the time before the target range, one after.
 - I'm going to say much more about TupleTableSlots in a moment,
@@ -836,17 +922,19 @@ Notes:
 - So what are these TupleTableSlots anyway?
 - If you're working in the executor you'll probably need to use one.
 - I couldn't find any talk or article talking about these things.
-- Fortunately the Postgres source has great comments, and most directories have a README.
+  - Fortunately the Postgres source has great comments, and most directories have a README.
 - Of course a tuple is more-or-less a row.
 - A "tuple table" is how the executor deals with processing tuples.
   - It's a table like the Range Table is a table: a list of structs.
+    - You have Target(List)Entry, RangeTblEntry, and TupleTableSlot: all the same pattern.
   - Each tuple is kept in a TupleTableSlot.
-  - Guess what? This is a node too (highlight)! Lots of the execState nodes have these as members.
+  - Guess what? This is a node too (highlight)! Lots of the exec nodes have these as members.
 
 - You can see we've got a list of `Datum`s and null flags (highlight).
   - Every other intro to Postgres talks about Datums, so I've kind of shied away from giving you lots of details here.
   - But basically a Datum is a single value: maybe from a column, or an evaluated expression, or whatever.
     - If you write your own C functions you get Datums in and send a Datum out.
+    - It's 64 bits wide, or maybe 32: basically a pointer size.
     - It doesn't tell you what type of data it's holding.
   - Then there are functions and macros to convert them to/from concrete types, e.g. `DatumGetInt64` or `Int64GetDatum`.
     - If the type is something small enough to be pass-by-value, this should be just a cast.
@@ -856,6 +944,7 @@ Notes:
 - So these two arrays let us get at the data in the tuple, but there's lots more info here *about* the tuple.
   - For example the tuple descriptor (highlight), which tells us how many attributes there are and what their types are---or actually the whole `pg_attribute` record if possible.
   - Or the memory context (highlight), etc.
+    - This is where we allocated the slot, not necessarily the tuple.
 
 - Now there are four kinds of TupleTableSlot:
   - You see this `tts_ops` field (highlight).
@@ -970,7 +1059,7 @@ Notes:
   - Like you're pinning it in place.
 - Looking at tuples in the buffer cache is sort of the normal case,
   but this is maybe the most complicated.
-  You can see it's a "subclass" of `HeapTableTableSlot`, just with a pointer to its buffer.
+  You can see it's a "subclass" of `HeapTupleTableSlot`, just with a pointer to its buffer.
 
 - The executor will use these all over the place.
 - It sort of helps explain why we have TupleTableSlots in the first place.
@@ -989,7 +1078,7 @@ Notes:
 Notes:
 
 - A minimal tuple is like a palloc'ed tuple, but it has no system columns.
-  - There is also a header struct that we leave out here.
+  - There is also a header struct that we leave out.
 - You might use this for computed tuples that don't come from disk.
 - I looked around to see where we use this:
   - hash joins
@@ -1033,16 +1122,17 @@ Notes:
 - So here (highlight) we are making a couple virtual TupleTableSlots for our leftovers.
 - It's interesting to ask why this is different from the slot just above (highlight)?
   - Well `table_slot_create` will give us a tuple slot that matches the Relation you pass in---
-    it should be a BufferHeapTupleTableSlot.
+    here it should be a BufferHeapTupleTableSlot.
   - For the leftovers we want a Virtual one.
-  - In all cases the tuple descriptor matches the table we're updating.
+  - In all three cases the tuple descriptor matches the table we're updating.
     - The lower functions need us to pass that in by hand.
       - That's tupDesc here.
     - But `table_slot_create` gets the descriptor automatically off the Relation struct.
   - Finally where do these slots go? In the tuple table!
     - At the top you see us pass the tuple table (highlight), which is part of the top-level executor state.
       - That's a List node and the slot gets appended there.
-    - In the bottom we're also passing the executor state, and those functions add the slot to the same list.
+      - To me it's sort of reassuring to glimpse the table these slots get put in.
+    - In the bottom we're also passing the executor state, which gives those functions access to the same list.
 
 
 
@@ -1064,7 +1154,11 @@ ExecInsert(context, resultRelInfo, leftoverTuple1,
 
 Notes:
 
-- Okay so we've got our tuple table slots,
+- There are lots of functions for what you can *do* with TupleTableSlots:
+  - create them, get the tuple out, store a tuple in, etc.
+  - To see the API surface I'd just look at the include files.
+  - But FOR PORTION OF gives us some examples:
+- We've got our tuple table slots,
   and here is our code again that actually does something with them.
 - Here (highlight) we pull out the old version of the row.
   This should just hand us back the reference, 
