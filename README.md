@@ -1,4 +1,4 @@
-# Postgres Pipeline: Esp Emph Exec
+# Postgres Pipeline: Especially Emphasizing Execution
 
 These are the slides and my notes for a talk about the Postgres query pipeline,
 in particular the executor phase.
