@@ -1,9 +1,7 @@
 # Postgres Pipeline: Especially Emphasizing Execution
 
-by Paul Jungwirth
-
-Illuminated Computing
-
+by Paul Jungwirth<br/>
+Illuminated Computing<br/>
 May 2023
 
 Notes:
@@ -38,7 +36,7 @@ Notes:
 - It has to parse your SQL,
   Make sure it makes sense,
   Possibly expand views and apply rewrite rules,
-  Build possible plan trees,
+  Build possible plans,
   Cost them and choose the best one,
   and finally run it!
 - There are lots of talks about writing custom C functions for Postgres,
@@ -98,7 +96,7 @@ Notes:
 Notes:
 
 - Here is a quick visualization of what FOR PORTION OF does.
-  - The SQL:2011 standard says when we update the original row we should force the start/end bounds to the period targeted by FOR PORTION OF . . .
+  - The SQL:2011 standard says when we update the original row we should cut the start/end bounds to the period targeted by FOR PORTION OF . . .
   - and then implicitly INSERT up to two new rows to preserve the "leftovers" the UPDATE didn't target.
   - The leftovers are green because they match the pre-update data.
     (Except we changed the start/end times.)
@@ -262,11 +260,11 @@ Notes:
   but now there is some clever codegen that does it for you.
   - There is still some tree-walking code with big switch statements where you might need to handle your new node type.
 
-- You will also see a lot of List members.
+- You will also see many things with type List.
   - A List is also a Node, but it's a node that has a bunch of other nodes.
   - There are functions to build them, iterate over them, append to them.
   - When people say that Postgres is lispy, this is part of what they mean.
-  - Actually a lightning talk on Postgres's Lisp history would be a lot of fun, if any of you are qualified to give that.
+  - Actually a lightning talk on Postgres's Lisp history would be a lot of fun, if you have that history.
 
 - Nodes & Lists are well-covered by other talks, so if you want to know more check the references at the end.
 
@@ -301,6 +299,10 @@ When a context ends, everything in it gets freed.
 To someone like me who writes a lot of Ruby and Python, this is awesome!
 The delight of writing C with totally insoucient memory management makes me want to do more Postgres.
 
+Now all the developers are squirming.
+It's not quite that simple in all places, but really it's so much easier than normal C memory management.
+Maybe that will encourage some others of you who don't write a lot of C to try out making a small patch.
+
 
 
 # Analysis
@@ -328,18 +330,15 @@ Notes:
   but it hasn't done any work yet to look up column names,
   validate your command, check permissions, etc.
 - That's what the analysis phase does.
-  - Here we can consult the database schema to find oids, types, etc.
-- It will transform your parse nodetree (here an UpdateStmt) into a Query nodetree.
+- It will transform your initial nodetree (here an UpdateStmt) into a Query nodetree.
   You can see the top-level result node will be Query (highlight).
-  The parse nodes should just capture what the user typed, as plainly as possible.
 - So the first thing we're doing is looking up the table to update (highlight).
-- Next if there was a `FOR PORTION OF` we translate that into plan nodes (highlight).
+- Next if there was a `FOR PORTION OF` we translate that into another node (highlight).
   - We feed in a `ForPortionOfClause`, we get back a `ForPortionOfExpr`, which is a different struct
     - with attribute numbers of the range or start/end columns,
     - also an Expression node turning the FROM & TO phrases into a range.
-    - I'm not going to show all those details today though.
 - Lots of the analysis work happens in functions named `transformThis` and `transformThat`,
-  like here we process a `FROM` if there was one.
+  like here we process a `FROM` clause if there was one.
   - Btw do you notice we aren't getting a return value here?
     - But we *are* passing in the top-level parse state....
 
@@ -363,14 +362,14 @@ typedef struct RangeTblEntry
 
 Notes:
 
-- Something you use all over the place are `RangeTblEntry`s.
-- The Query struct has a List called `rtable`,
-  which holds a bunch of these structs.
-  - When we process the FROM clause we're adding to that list.
-- A range table is:
-  1. not a database table (i.e. not a relation).
-  2. has nothing to do with range types.
-- It's a table as in a list of structs.
+- The ParseState struct has a List member that holds RangeTblEntries.
+- You use these all over the place.
+- Later we'll also attach these RangeTblEntries to the Query node.
+- So what are range tables?
+  1. the range is not a range type
+  2. the table is not a database table.
+- Actually range means table---or relation I should say.
+- And it's a table as in a List of structs.
 - Each struct is a quote-unquote range: which is basically a relation:
   - either a true persisted table,
   - or the result of a subquery or join,
@@ -408,7 +407,8 @@ Notes:
 - Here `FOR PORTION OF` is looking up the period name (higlight).
 - You see we're calling `SearchSysCache2`.
   This is defined in `utils/cache/syscache.c`.
-  We give it the cache name, here `PERIODNAME`. That determines the table to query, the index the use, and how big the cache should be.
+  `PERIODNAME` in caps is the name of the cache.
+  That determines the table to query, the index the use, and how big the cache should be.
   This is search *2* because we search based on two attributes. Here the relation id (i.e. the table), and the period name. That uniquely identifies a PERIOD. So those are the other arguments you see.
 - We don't necessarily get a result (highlight), so we have to check if we got something,
   and maybe report an error if not.
@@ -531,7 +531,7 @@ Notes:
 - This `range_name_location` item you see is something we ask bison to set all over.
   It helps us point to the right place if we need to report an error.
 - And finally we call transform on our node (highlight).
-  - One thing this does is make sure you aren't calling unsupported functions.
+  - One thing this does is make sure you aren't using unsupported features.
   - For instance you can't run a subquery here,
     or call a window function.
 - We stick this expression on our struct so we can use it later.
@@ -561,11 +561,11 @@ Notes:
 
 - Here we've got some code to set the new bounds on the record.
 - We take the old bounds and intersect them with the targeted range.
-- You can see are making this TargetEntry or TLE. TLE for Target List Entry.
+- You can see we are making this TargetEntry or TLE. TLE for Target List Entry.
 - In an update query you have one of these for each column you're setting.
   - In a select you use them for the SELECT'd columns.
 - Also we add it to the list of columns that need permission checks.
-- A TLE is a lot like an RangeTblEntry: one item in a List of structs.
+- A TLE is a lot like a RangeTblEntry: one item in a List of structs.
 
 
 
@@ -577,7 +577,7 @@ Notes:
 
 Notes:
 
-I don't want to spend much time on rewriting, but this is where we expand VIEWs and apply RULEs.
+Rewriting: this is where we expand VIEWs and apply RULEs.
 The main functions take a Query node and return a List of zero or more Query nodes.
 In the really easy cases we're just wrapping the passed-in Query node.
 
@@ -681,7 +681,7 @@ Notes:
 - ExecutorStart (highlight) sets up . . . another node tree.
   - `CreateExecutorState` creates an EState struct which has info about the overall execution.
   - Most plan nodes require some mutable state to execute, so each of them gets a corresponding PlanState node.
-      - The struct is called PlanState but I'll refer to them as executor nodes.
+      - The struct is called PlanState but I think of them as executor nodes.
     - Plan & PlanState are like counterparts.
     - You can imagine these parallel trees.
     - So we have to call ExecInitModifyTable and ExecInitThis and ExecInitThat.
@@ -715,7 +715,7 @@ typedef struct PlanState
 Notes:
 
 - Here is what our executor nodes inherit from.
-- Each one has a type, just like any node (highlight)
+- Each one has a type, just like any node (highlight).
 - Each gets a reference to its plan node (highlight).
   - That's it's counterpart.
   - Whereas the PlanState is mutable, the Plan node is stable for the whole executor phase.
@@ -925,8 +925,8 @@ Notes:
   - Fortunately the Postgres source has great comments, and most directories have a README.
 - Of course a tuple is more-or-less a row.
 - A "tuple table" is how the executor deals with processing tuples.
-  - It's a table like the Range Table is a table: a list of structs.
-    - You have Target(List)Entry, RangeTblEntry, and TupleTableSlot: all the same pattern.
+  - It's a table of slots.
+    - Now we've seen Target(List)Entry, RangeTblEntry, and TupleTableSlot: all the same pattern.
   - Each tuple is kept in a TupleTableSlot.
   - Guess what? This is a node too (highlight)! Lots of the exec nodes have these as members.
 
@@ -971,7 +971,7 @@ Notes:
 
 - So let's start with HeapTupleTableSlots.
 - Here is our C-style inheritance: we're a subclass of TupleTableSlot (highlight).
-- We have this reference to a HeapTable (highlight).
+- We have this reference to a HeapTuple (highlight).
   - That's defined in access/htup.h.
   - It's got the memory that actually holds the tuple data.
   - A HeapTupleTableSlot points to palloc'd memory, so that's what's in there.
@@ -1029,9 +1029,10 @@ Notes:
   - This isn't a slot, which are just things to help out the executor.
   - This is just the tuple.
 - And back there we used `GETSTRUCT`
-  - which just follows the pointer to the real tuple data and casts it to a struct.
+  - which just adds a small offset to our pointer.
+  - And then we cast it.
   - That works for catalog tables because we have compile-time structs for them.
-  - For ordinary user tables we use `slot_getattr`.
+  - But for ordinary user tables we use `slot_getattr`.
 
 
 
@@ -1052,13 +1053,13 @@ typedef struct BufferHeapTupleTableSlot
 Notes:
 
 - Now here's a next type of TupleTableSlot: A BufferHeapTupleTableSlot.
-- Whereas a HeapTupleTableSlot is stored in palloc'd memory, a BufferHeapTupleTableSlot is stored in our disk buffer.
+- Whereas a HeapTupleTableSlot is stored in palloc'd memory, a BufferHeapTupleTableSlot is stored in our disk buffer: `shared_buffers` from `postgresql.conf`.
 - In fact the HeapTuples you get from syscache are examples of this.
 - For these tuples we need to take & release buffer pins, not alloc & free memory.
   - A pin says "Don't throw this buffer page away; I'm using it!"
   - Like you're pinning it in place.
 - Looking at tuples in the buffer cache is sort of the normal case,
-  but this is maybe the most complicated.
+  but this is maybe the most complicated slot type.
   You can see it's a "subclass" of `HeapTupleTableSlot`, just with a pointer to its buffer.
 
 - The executor will use these all over the place.
@@ -1191,7 +1192,7 @@ Notes:
 # References
 <!-- .slide: style="font-size: 45%; text-align: left" class="bibliography" -->
 
-1. Selena Deckelmann, *So, you want to a developer*, 2011. https://wiki.postgresql.org/wiki/So,_you_want_to_be_a_developer%3F
+1. Selena Deckelmann, *So, you want to be a developer*, 2011. https://wiki.postgresql.org/wiki/So,_you_want_to_be_a_developer%3F
 
 1. Laetitia Avrot, *Demystifying Contributing to PostgreSQL*, 2018. https://www.slideshare.net/LtitiaAvrot/demystifying-contributing-to-postgresql
 
