@@ -9,6 +9,8 @@ It is built on [reveal.js](https://github.com/hakimel/reveal.js/).
 You also can get [all the slides as a PDF](slides.pdf),
 or [read the slides' Markdown with speaker notes](slides.md).
 
+The video is [on my site](https://illuminatedcomputing.com/pages/pgcon2023/).
+
 ## Development
 
 You can run the slides locally by saying:
